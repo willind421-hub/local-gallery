@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "local-gallery"
+version = "0.1.0"
+description = "Read-only, dependency-free web gallery for local folders of generated artefacts (images, video, audio, HTML) with original-quality downloads."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "willind" }]
+keywords = ["gallery", "http.server", "read-only", "media", "file-browser", "path-traversal"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Multimedia :: Graphics :: Viewers",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+local-gallery = "local_gallery.gallery:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/local_gallery"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
