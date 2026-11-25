@@ -16,27 +16,40 @@ change, delete, or wander outside those folders.
 Local Gallery separates the two roles: whatever produces files writes them; the gallery
 only reads and shows them.
 
-## What it guarantees
+## Safeguards
 
 - **Read-only.** Only `GET` is implemented. `POST`/`PUT`/`DELETE` answer `405`, any other
   method `501`. The code contains no call that writes, renames or deletes files.
   Downloading an original is a read and is supported.
 - **Confined to registered roots.** `..` segments, drive letters and other `:` segments
-  (including NTFS alternate data streams), absolute paths, percent-encoded traversal, and
+  (including NTFS alternate data streams), unregistered paths, percent-encoded traversal, and
   symlinks/junctions that lead outside a root are refused. Containment is checked on the
-  fully resolved path.
+  fully resolved path in a stable tree; concurrent filesystem replacement is not secured
+  (see limitations).
 - **Hidden and secret-looking entries stay invisible.** Dot files and names that look like
   credentials (`.env`, `*.pem`, `*.key`, `id_rsa`, names containing `token`, `secret`,
-  `password`, `credential`, directories such as `.ssh`, `.aws`, …) are left out of
+  `password`, `credential`, `auth.json`, browser `Cookies`/`Login Data`, `id_ed25519`,
+  `id_ecdsa`, `.ppk`, `.kdbx`, `.jks`, `wallet.dat`, directories such as `.ssh`, `.aws`,
+  `AppData`, …) are left out of
   listings and cannot be fetched — not even through an alias such as a Windows 8.3 short
   name (`ENV~1`) or an innocent-looking symlink inside the root.
-- **Active content never runs on the gallery's origin.** SVG, HTML and XML files are always
-  sent as attachments with `Content-Security-Policy: default-src 'none'; sandbox`;
-  every file response carries `X-Content-Type-Options: nosniff`.
+- **Fixed inline allowlist, not platform MIME guesses.** Only the raster image, video,
+  audio and `.txt` extensions in `_INLINE_TYPES` are sent inline with a fixed MIME type.
+  Everything else (including SVG/HTML/XML, `.xht`, `.rdf`, `.xsd`, `.wsdl`, unknown
+  extensions) is `application/octet-stream` + attachment +
+  `Content-Security-Policy: default-src 'none'; sandbox`. Every file response carries
+  `X-Content-Type-Options: nosniff`. This is a response policy, not a browser vulnerability
+  guarantee; SVG thumbnails may not render under the attachment policy.
 - **Any file name downloads.** `Content-Disposition` follows RFC 6266 / RFC 5987: an
   ASCII fallback plus the exact UTF-8 name in `filename*`, so Korean, Japanese or emoji
   names keep their name, and quotes or CR/LF in a name cannot inject headers.
 - **Local by default.** Binds `127.0.0.1` unless told otherwise.
+- **Host validation before authentication.** Only the configured bind name/address and
+  actual port are accepted (plus `localhost`/`127.0.0.1` for local binds). Missing,
+  duplicate or untrusted `Host` headers get `421`. A wildcard bind does not permit arbitrary
+  LAN hostnames; a reverse proxy must forward an accepted local Host including its port.
+- **Non-loopback requires a token.** CLI/API refuse before binding when no token is set;
+  only loopback IP literals and `localhost` qualify for the token-free bind.
 - **Optional access token** with an HttpOnly session cookie (see below).
 
 ## Design
@@ -64,10 +77,14 @@ over HTTP.
 Thumbnails are the originals scaled by the browser (`<img loading="lazy">`); there is no
 server-side cache or transcoding. Files are streamed in 64 KiB chunks.
 
-**Token flow.** When `LOCAL_GALLERY_TOKEN` is set, the first request must carry
-`?token=<value>`. The response sets an `HttpOnly; SameSite=Strict` cookie, so links inside
-the gallery work without the token in the URL. Requests with neither a matching token nor
-the cookie get `401`. Comparison is constant-time.
+**Token flow.** With `LOCAL_GALLERY_TOKEN` set, first open `/?token=<value>`. A successful
+page/file response issues `local_gallery=<random session ID>; Path=/; HttpOnly;
+SameSite=Strict; Max-Age=3600`, never the reusable login token. Session IDs are stored
+server-side in memory, valid only on that server for an absolute one hour (navigation
+does not extend it). At most 1024 sessions are retained; oldest sessions are evicted.
+Restarting invalidates all sessions. Links omit the login token; a valid session or query
+token is required, otherwise `401`. Login-token comparison is constant-time.
+All responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
 
 ## Quick start
 
@@ -96,10 +113,17 @@ audio players, and a ⬇ button that downloads the original.
 `--root` takes precedence over `LOCAL_GALLERY_ROOTS`. A root without `NAME=` is named after
 its folder; two roots with the same name are rejected.
 
+Only an **unset** `LOCAL_GALLERY_ROOTS` permits cwd fallback. An explicitly set empty,
+malformed or nonexistent registry with no valid directories fails before serving.
+`parse_roots` still ignores individual invalid entries and keeps valid ones for API
+compatibility. Implicit home/drive roots are refused; deliberately serving one requires
+`--root`. Even another cwd can contain private files: prefer a dedicated output folder.
+
 ### Access token
 
-The token is read from the environment only, so it does not end up in shell history or
-process listings. Use a random URL-safe ASCII value:
+The CLI reads the token from the environment, not a command-line argument (so it is not
+in process arguments). Do not type a literal secret into shell history. Use a random
+URL-safe ASCII value:
 
 ```bash
 export LOCAL_GALLERY_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(24))')"
@@ -119,10 +143,11 @@ token once.
 | --- | --- |
 | `GET /` | one card per root |
 | `GET /view?path=ROOT/sub/dir` | folder grid |
-| `GET /raw?path=ROOT/sub/file` | the file (inline for media, attachment for SVG/HTML/XML) |
+| `GET /raw?path=ROOT/sub/file` | inline only for the fixed allowlist; all other files are attachments |
 | `GET /raw?path=ROOT/sub/file&download=1` | the file as an attachment |
 
-Refusals: `401` token required, `403` path rule violation, `404` missing, `405` write method.
+Refusals: `401` token required, `403` path rule violation, `404` missing, `405` write method,
+`421` untrusted Host.
 
 ## Running tests
 
@@ -144,22 +169,36 @@ python examples/demo.py          # synthetic folder, real server, prints what it
 python examples/demo.py --keep   # same, then keeps serving so you can browse it
 ```
 
-The demo builds a PNG gradient, a Korean-named HTML report, a note and a hidden `.env` in
-a temporary folder, then shows the listing, the RFC 5987 download header and the refused
-requests (`../`, `%2e%2e`, `.env`, `POST`).
+The demo builds a PNG gradient, a Korean-named HTML report, a note, a `.xht` attachment
+and synthetic hidden `.env`/`auth.json` in a temporary folder. It asserts listing/download
+links, bytes, RFC 5987 headers, attachment policy and refusals (`../`, `%2e%2e`, `.env`,
+`auth.json`, `POST`), then prints the responses. A mismatch exits nonzero.
 
 ## Limitations and non-goals
 
 - No upload, delete, rename or editing — by design.
 - No TLS and no user accounts. Keep it on `127.0.0.1`; for remote access use a VPN or an
   authenticated reverse proxy rather than binding a public interface.
-- The token is a single shared value stored in a cookie as is.
+- Cookies are **not port-isolated**: another service on the same host can receive this
+  live session ID and replay it to the issuing gallery until expiry. HttpOnly/SameSite do
+  not prevent that; the login token is no longer exposed, but session theft remains.
+  Use a dedicated gallery hostname not shared with untrusted services (and configure the
+  accepted bind/forwarded Host). Cookies on different gallery ports can also overwrite
+  each other. This HTTP server does not mark cookies Secure. The first token URL can remain
+  in browser history; headers do not erase it. There is no per-session logout endpoint;
+  restart or expiry invalidates sessions.
 - No server-side thumbnails, transcoding or pagination. Large folders of large images are
   heavy for the browser, and listings stop at 2000 entries per folder.
 - No `HEAD` or HTTP `Range` support, so seeking in long videos may be limited and some
   browsers may refuse to stream video.
 - The hidden-file filter matches names, not contents. Do not point a root at a folder that
   holds secrets under ordinary names.
+- **Filesystem race remains:** validation/`stat`/`open` are separate path operations, not
+  a root-relative safe-handle traversal. A concurrent writer replacing files, symlinks or
+  junctions can change what is read, escape the checked tree or invalidate response size.
+  Serve trusted stable copies, with writers stopped or the tree made read-only by the
+  operator; the gallery does not create a snapshot or enforce that. Stable-link tests are
+  not proof of race safety. Do not serve an attacker-writable tree.
 - A listing may show a symlink whose target is outside the root (with the target's size);
   opening it is refused.
 

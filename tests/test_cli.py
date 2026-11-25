@@ -114,3 +114,41 @@ def test_main_passes_options_to_serve(tmp_path, monkeypatch):
     assert gallery.main(["--host", "127.0.0.1", "--port", "0"]) == 0
     assert seen["roots"] == {tmp_path.resolve().name: tmp_path.resolve()}
     assert seen["host"] == "127.0.0.1" and seen["port"] == 0 and seen["token"] is None
+
+
+@pytest.mark.parametrize("spec", ["", "   ", "broken", "absent=missing"])
+def test_invalid_explicit_env_roots_never_fall_back(tmp_path, monkeypatch, spec):
+    seen = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LOCAL_GALLERY_ROOTS", spec)
+    monkeypatch.setattr(gallery, "serve", lambda *a, **kw: seen.append(a))
+    assert gallery.main([]) == 1
+    assert seen == []
+
+
+@pytest.mark.parametrize("location", ["home", "drive"])
+def test_implicit_broad_root_refused(tmp_path, monkeypatch, location):
+    # Synthetic home; drive path is inspected only, never listed or served.
+    cwd = tmp_path if location == "home" else Path(tmp_path.anchor)
+    monkeypatch.setattr(Path, "cwd", classmethod(lambda cls: cwd))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("LOCAL_GALLERY_ROOTS", raising=False)
+    seen = []
+    monkeypatch.setattr(gallery, "serve", lambda *a, **kw: seen.append(a))
+    assert gallery.main([]) == 1
+    assert seen == []
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.0.2.1", "example.invalid"])
+def test_nonloopback_without_token_refused_before_bind(tmp_path, monkeypatch, capsys, host):
+    import http.server
+
+    # Never bind a public interface or resolve a hostname, even on the RED run.
+    monkeypatch.setattr(http.server, "ThreadingHTTPServer",
+                        lambda *a, **kw: pytest.fail("must refuse before binding"))
+    monkeypatch.delenv("LOCAL_GALLERY_TOKEN", raising=False)
+    roots = {"demo": tmp_path.resolve()}
+    with pytest.raises(ValueError, match="non-loopback.*token"):
+        gallery.serve(roots, host=host, port=0)
+    assert gallery.main(["--root", str(tmp_path), "--host", host, "--port", "0"]) == 1
+    assert "non-loopback" in capsys.readouterr().out

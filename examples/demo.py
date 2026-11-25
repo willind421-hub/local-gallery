@@ -53,6 +53,8 @@ def make_demo_folder(root: Path) -> None:
         encoding="utf-8")
     (root / "notes.txt").write_text("Synthetic note for the demo.\n", encoding="utf-8")
     (root / ".env").write_text("DEMO_ONLY=1\n", encoding="utf-8")   # must stay hidden
+    (root / "auth.json").write_text('{"example": "not-a-real-secret"}', encoding="utf-8")
+    (root / "report.xht").write_text("<html><body>attachment only</body></html>", encoding="utf-8")
 
 
 def free_port() -> int:
@@ -103,24 +105,39 @@ def main() -> int:
         try:
             wait_until_up(proc, port)
             st, _, body = request(base, "/")
+            assert st == 200 and body.count(b'card dir') == 1, "start page must list one root"
             print(f"GET /                         -> {st}, root cards: {body.count(b'card dir')}")
             st, _, body = request(base, "/view?path=demo")
             page = body.decode("utf-8")
+            assert st == 200 and all(n in page for n in ("images", "reports", "notes.txt"))
+            assert ".env" not in page and "auth.json" not in page
+            assert page.count("download=1") == 2, "every visible file needs a download link"
             shown = [n for n in ("images", "reports", "notes.txt", ".env") if n in page]
             print(f"GET /view?path=demo           -> {st}, listed: {shown}")
             q = urllib.parse.quote("demo/reports/요약 보고서.html")
             st, hdrs, body = request(base, f"/raw?path={q}&download=1")
+            assert st == 200 and body == (root / "reports" / "요약 보고서.html").read_bytes()
+            assert hdrs.get("Content-Disposition", "").startswith("attachment;")
+            assert "filename*=UTF-8''" in hdrs["Content-Disposition"]
             print(f"download Korean-named report  -> {st}, {len(body)} bytes")
             print(f"  Content-Disposition: {hdrs.get('Content-Disposition')}")
             st, hdrs, body = request(base, "/raw?path=demo/images/gradient.png")
+            assert st == 200 and hdrs.get("Content-Type") == "image/png"
+            assert body == (root / "images" / "gradient.png").read_bytes()
             print(f"GET gradient.png (inline)     -> {st}, {hdrs.get('Content-Type')}, "
                   f"{len(body)} bytes")
-            for label, path, method in (
-                    ("traversal ../", "/raw?path=demo/../outside.txt", "GET"),
-                    ("encoded %2e%2e", "/raw?path=demo%2F%2e%2e%2Foutside.txt", "GET"),
-                    ("hidden .env", "/raw?path=demo/.env", "GET"),
-                    ("POST (write)", "/raw?path=demo/notes.txt", "POST")):
+            st, hdrs, _ = request(base, "/raw?path=demo/report.xht")
+            assert st == 200 and hdrs.get("Content-Type") == "application/octet-stream"
+            assert hdrs.get("Content-Disposition", "").startswith("attachment;")
+            print(f"GET report.xht                -> {st}, attachment-only")
+            for label, path, method, expected in (
+                    ("traversal ../", "/raw?path=demo/../outside.txt", "GET", 403),
+                    ("encoded %2e%2e", "/raw?path=demo%2F%2e%2e%2Foutside.txt", "GET", 403),
+                    ("hidden .env", "/raw?path=demo/.env", "GET", 403),
+                    ("denylisted auth.json", "/raw?path=demo/auth.json", "GET", 403),
+                    ("POST (write)", "/raw?path=demo/notes.txt", "POST", 405)):
                 st, _, _ = request(base, path, method)
+                assert st == expected, f"{label}: expected {expected}, got {st}"
                 print(f"refused: {label:<20} -> {st}")
             if args.keep:
                 print(f"\nBrowse {base}/  (Ctrl+C to stop)")

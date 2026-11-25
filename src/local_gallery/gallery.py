@@ -14,11 +14,13 @@ Design:
   authenticated reverse proxy instead of binding a public interface directly. The
   optional token (env ``LOCAL_GALLERY_TOKEN``) is a second line of defence.
 - **Layered path defence** - unregistered root / ``..`` and drive-letter segments /
-  hidden or secret-looking names / ``resolve()`` containment (also defeats symlinks) /
+  hidden or secret-looking names / ``resolve()`` containment for stable symlinks /
   hidden-name re-check on the resolved path. The checks are pure functions, so tests
-  verify that they actually block.
+  verify stable-tree cases. Validation and open are separate: this is not a sandbox
+  against a writer replacing files or links concurrently.
 - **Roots are a registry** (``NAME=PATH;NAME=PATH``) - a new folder is one more entry.
-  Without a registry the current working directory is served.
+  Without a registry the current working directory is served (implicit home/drive root
+  is refused). An explicitly configured invalid registry never falls back to cwd.
 
 Usage: ``local-gallery [--root [NAME=]PATH ...] [--host 127.0.0.1] [--port 18140]``
        (or ``python -m local_gallery``). Environment: ``LOCAL_GALLERY_ROOTS``,
@@ -29,8 +31,11 @@ from __future__ import annotations
 import hmac
 import html
 import http.cookies
-import mimetypes
+import ipaddress
 import os
+import secrets
+import threading
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -42,23 +47,29 @@ from typing import Dict, List, Optional, Tuple
 _SECRET_MARKERS = (
     ".env", "credential", "secret", "token", "password",
     ".jks", ".pem", ".key", "id_rsa", ".pfx", ".p12",
+    "id_ed25519", "id_ecdsa", ".ppk", ".kdbx",
 )
-_SECRET_DIRS = {".ssh", ".aws", ".gnupg", ".secrets", "credentials"}
+_SECRET_DIRS = {".ssh", ".aws", ".gnupg", ".secrets", "credentials", "appdata"}
+_SECRET_NAMES = {"auth.json", "cookies", "login data", "wallet.dat"}
 
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".avif"}
 _VIDEO_EXT = {".mp4", ".webm", ".mov", ".m4v", ".ogv"}
 _AUDIO_EXT = {".mp3", ".wav", ".ogg", ".m4a", ".flac"}
 _MAX_LIST = 2000            # max entries listed per folder (runaway protection)
 
-# Formats that can run script on the gallery's origin (XSS) when opened top-level.
-# .svg is still shown as an image in the grid (an <img> thumbnail cannot run script), but
-# opening it directly is dangerous - this set is only ever served as an attachment, so
-# it is never rendered inline.
-_INLINE_UNSAFE_EXT = {
-    ".svg", ".svgz", ".html", ".htm", ".xhtml", ".shtml",
-    ".xml", ".xsl", ".xslt", ".mathml",
+# Fixed passive inline types; never consult the OS MIME registry. Everything else is
+# octet-stream + attachment + sandbox, including SVG/HTML/XML and unknown extensions.
+_INLINE_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".avif": "image/avif", ".mp4": "video/mp4", ".webm": "video/webm",
+    ".mov": "video/quicktime", ".m4v": "video/mp4", ".ogv": "video/ogg",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4", ".flac": "audio/flac", ".txt": "text/plain; charset=utf-8",
 }
-_COOKIE_NAME = "local_gallery"   # HttpOnly session cookie set after the first (query) token
+_COOKIE_NAME = "local_gallery"   # contains only a random, server-local session ID
+_SESSION_TTL = 3600             # absolute lifetime; navigation does not extend it
+_MAX_SESSIONS = 1024            # oldest sessions evicted when the bound is reached
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18140
@@ -100,7 +111,7 @@ def parse_roots(spec: Optional[str], default_root: Optional[Path] = None,
 def is_hidden(name: str) -> bool:
     """True for secret/protected or hidden (dot) names - excluded from listing and access."""
     low = name.lower()
-    if low in _SECRET_DIRS:
+    if low in _SECRET_DIRS or low in _SECRET_NAMES:
         return True
     if name.startswith(".") and name not in (".",):
         return True
@@ -249,9 +260,10 @@ def render_dir_page(root_name: str, rel: str, entries: List[dict]) -> str:
                          f'<audio controls preload="none" src="/raw?path={child}"></audio>'
                          f'<div class="meta">{label}<a class="dl" href="/raw?path={child}&download=1">⬇</a></div></div>')
         else:
-            cells.append(f'<a class="card" href="/raw?path={child}" target="_blank">'
-                         f'<div class="thumb ph">📄</div>'
-                         f'<div class="meta">{label} <span class="sz">{_human_size(e["size"])}</span></div></a>')
+            cells.append(f'<div class="card"><a href="/raw?path={child}" target="_blank">'
+                         f'<div class="thumb ph">📄</div></a>'
+                         f'<div class="meta">{label} <span class="sz">{_human_size(e["size"])}</span>'
+                         f'<a class="dl" href="/raw?path={child}&download=1">⬇</a></div></div>')
     grid = "".join(cells) or '<p class="empty">Empty folder.</p>'
     return _PAGE.replace("{{title}}", html.escape(cur)).replace(
         "{{crumb}}", crumb).replace("{{grid}}", grid)
@@ -284,11 +296,43 @@ audio{width:100%;padding:0 8px 8px}
 
 # ---------------------------------------------------------------- HTTP server (thin shell)
 
-def _make_handler(roots: Dict[str, Path], token: Optional[str]):
+def _make_handler(roots: Dict[str, Path], token: Optional[str], *, host: Optional[str] = None):
     from http.server import BaseHTTPRequestHandler
+
+    # One handler factory per server; nothing is persisted or shared across servers.
+    sessions: Dict[str, float] = {}
+    session_lock = threading.Lock()
+
+    def prune_sessions(now: float):
+        for sid, expires in list(sessions.items()):
+            if expires <= now:
+                del sessions[sid]
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "local-gallery/1"
+
+        def end_headers(self):
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            super().end_headers()
+
+        def _valid_host(self) -> bool:
+            # Exact authorities, not DNS resolution of attacker-supplied names.
+            values = self.headers.get_all("Host", [])
+            if len(values) != 1:
+                return False
+            address, port = self.server.server_address[:2]
+            names = {address.lower()}
+            if host:
+                names.add(host.lower())
+            ip = ipaddress.ip_address(address)
+            if ip.is_loopback or ip.is_unspecified:
+                names.update({"localhost", "127.0.0.1"})
+            names.difference_update({"0.0.0.0", "::"})
+            authorities = {f"[{n}]:{port}" if ":" in n else f"{n}:{port}" for n in names}
+            if port == 80:
+                authorities.update(names)
+            return values[0].lower() in authorities
 
         def _deny(self, code: int, msg: str):
             self.send_response(code)
@@ -312,25 +356,35 @@ def _make_handler(roots: Dict[str, Path], token: Optional[str]):
         def _authed(self, qs: dict) -> bool:
             if not token:
                 return True
-            # 1) Query-parameter token = the entry door. On success the response sets an
-            #    HttpOnly cookie, so later navigation does not carry the token in the URL
-            #    (keeps it out of logs and history).
+            # The first URL can remain in browser history; later links omit the token.
             given = (qs.get("token") or [""])[0]
             if given and _token_matches(given, token):
                 self._auth_via_query = True
                 return True
-            # 2) Cookie (session after the first authentication). Neither -> refused.
-            return _token_matches(self._cookie_token(), token)
+            # A reusable login token is never accepted as a session ID.
+            sid = self._cookie_token()
+            with session_lock:
+                prune_sessions(time.monotonic())
+                return sid in sessions
 
         def _maybe_set_cookie(self):
             """After a query-token login, issue the HttpOnly session cookie."""
             if getattr(self, "_auth_via_query", False) and token:
+                with session_lock:
+                    now = time.monotonic()
+                    prune_sessions(now)
+                    while len(sessions) >= _MAX_SESSIONS:
+                        del sessions[next(iter(sessions))]
+                    sid = secrets.token_urlsafe(32)
+                    sessions[sid] = now + _SESSION_TTL
                 self.send_header(
                     "Set-Cookie",
-                    f"{_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict")
+                    f"{_COOKIE_NAME}={sid}; Path=/; HttpOnly; SameSite=Strict; Max-Age={_SESSION_TTL}")
 
         def do_GET(self):
             self._auth_via_query = False
+            if not self._valid_host():
+                return self._deny(421, "untrusted Host")
             parsed = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(parsed.query)
             if not self._authed(qs):
@@ -378,12 +432,8 @@ def _make_handler(roots: Dict[str, Path], token: Optional[str]):
             self.wfile.write(data)
 
         def _serve_file(self, target: Path, download: bool):
-            ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-            # Active formats (svg/html/xml family) would run script on the gallery origin
-            # if opened top-level (XSS). Never render them inline - attachment only. Grid
-            # <img> thumbnails are sub-resources, are not affected by this header and
-            # cannot run script, so they still display.
-            unsafe = target.suffix.lower() in _INLINE_UNSAFE_EXT
+            inline_type = _INLINE_TYPES.get(target.suffix.lower())
+            ctype = inline_type or "application/octet-stream"
             try:
                 size = target.stat().st_size
                 self.send_response(200)
@@ -392,7 +442,7 @@ def _make_handler(roots: Dict[str, Path], token: Optional[str]):
                 self.send_header("Content-Length", str(size))
                 # Block MIME sniffing - a type/extension mismatch cannot be "upgraded".
                 self.send_header("X-Content-Type-Options", "nosniff")
-                if unsafe:
+                if not inline_type:
                     self.send_header("Content-Disposition", content_disposition(target.name))
                     # Even if it does get opened inline, block script and external loads.
                     self.send_header("Content-Security-Policy",
@@ -426,7 +476,16 @@ def serve(roots: Dict[str, Path], *, host: str = DEFAULT_HOST, port: int = DEFAU
           token: Optional[str] = None):
     """Serve ``roots`` read-only until Ctrl+C."""
     from http.server import ThreadingHTTPServer
-    handler = _make_handler(roots, token)
+    if not token:
+        # Classify the configured name, never resolve arbitrary DNS names as proof of
+        # safety. A hostname other than localhost needs a token even if it resolves local.
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host.lower() == "localhost"
+        if not loopback:
+            raise ValueError("non-loopback binding requires a token (LOCAL_GALLERY_TOKEN)")
+    handler = _make_handler(roots, token, host=host)
     srv = ThreadingHTTPServer((host, port), handler)
     _say(f"local-gallery - http://{host}:{port}  roots: {', '.join(roots) or '(none)'}"
          + ("  [token]" if token else ""))
@@ -477,13 +536,21 @@ def main(argv=None):
             roots.update(got)
     else:
         cwd = Path.cwd()
-        roots = parse_roots(os.environ.get("LOCAL_GALLERY_ROOTS"), default_root=cwd,
+        spec = os.environ.get("LOCAL_GALLERY_ROOTS")
+        if spec is None and (cwd.resolve() == Path.home().resolve() or cwd.parent == cwd):
+            _say("refusing implicit home or drive root - pass --root PATH explicitly.")
+            return 1
+        roots = parse_roots(spec, default_root=cwd if spec is None else None,
                             default_name=_folder_name(cwd))
     token = os.environ.get("LOCAL_GALLERY_TOKEN") or None
     if not roots:
         _say("no roots - pass --root PATH or set LOCAL_GALLERY_ROOTS.")
         return 1
-    serve(roots, host=args.host, port=args.port, token=token)
+    try:
+        serve(roots, host=args.host, port=args.port, token=token)
+    except ValueError as exc:
+        _say(str(exc))
+        return 1
     return 0
 
 

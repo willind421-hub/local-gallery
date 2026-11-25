@@ -163,9 +163,9 @@ def test_authed_query_and_cookie_unit(tmp_path):
     h.headers = {}
     assert h._authed({"token": ["sekret"]}) is True
     assert h._auth_via_query is True
-    # Cookie alone also passes (session after the first authentication).
+    # The reusable login token must never authenticate as a session cookie.
     h.headers = {"Cookie": "local_gallery=sekret"}
-    assert h._authed({}) is True
+    assert h._authed({}) is False
     # No token, no cookie, wrong value: all refused.
     h.headers = {}
     assert h._authed({}) is False
@@ -188,10 +188,10 @@ def test_token_cookie_session_navigation(tmp_path):
         status, hdrs, _ = _req(srv, "/?token=sekret")
         assert status == 200
         setc = hdrs.get("Set-Cookie") or ""
-        assert "local_gallery=sekret" in setc
+        assert "local_gallery=" in setc and "sekret" not in setc
         assert "HttpOnly" in setc and "SameSite=Strict" in setc
         # (a') Navigation with the cookie only - no token in the URL.
-        cookie = {"Cookie": "local_gallery=sekret"}
+        cookie = {"Cookie": setc.split(";", 1)[0]}
         st2, _, body2 = _req(srv, "/view?path=outputs", headers=cookie)
         assert st2 == 200 and b"shot.png" in body2
         assert _req(srv, "/raw?path=outputs/shot.png", headers=cookie)[0] == 200
